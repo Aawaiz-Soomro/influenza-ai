@@ -113,7 +113,13 @@ function BrandProfileInner() {
           const { data, error } = await supabase.from("profiles").select("embedding").eq("id", authId).single();
           if (data && data.embedding !== null) {
             clearInterval(pollInterval);
-            toast.success("Profile saved and vector generation complete!", { id: "vector-gen" });
+            
+            // Check if the backend wrote the error vector (all -1.0s)
+            if (data.embedding[0] === -1.0) {
+              toast.error("Vector generation failed (Check your Instagram session)", { id: "vector-gen" });
+            } else {
+              toast.success("Profile saved and vector generation complete!", { id: "vector-gen" });
+            }
           } else if (error) {
             console.error("Polling error:", error);
           }
