@@ -32,7 +32,30 @@ type MatchResult = {
   engagement_rate: number;
   rate_per_post: number | null;
   match_score: number;
+  reasons?: { reason: string; weight: number | null; text: string }[];
 };
+
+type Mode = "classifier" | "classifier_reranker";
+type V2Result = {
+  brand: { username: string; instagram_category: string; posts_analysed: number; category_probs: Record<string, number>; collaborators_found: string[] };
+  classifier: { brand_category: string; brand_category_confidence: number; platform: any[] };
+  classifier_reranker: { model: string; seeds_used: string[]; platform: any[] };
+};
+
+const API_URL = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+const toMatches = (rows: any[]): MatchResult[] =>
+  (rows ?? []).map((r: any) => ({
+    id: String(r.influencer?.id ?? r.username),
+    name: r.influencer?.name ?? r.username,
+    niche: r.influencer?.niche ?? r.content_category,
+    avatar_url: r.influencer?.avatar_url ?? null,
+    engagement_rate: Number(r.influencer?.engagement_rate ?? 0),
+    rate_per_post: r.influencer?.rate_per_post != null ? Number(r.influencer.rate_per_post) : null,
+    match_score: Math.round(Math.max(0, Math.min(1, Number(r.match_score ?? 0))) * 10000) / 100,
+    reasons: r.reasons ?? [],
+  }));
 
 const initial: FormState = {
   name: "",
@@ -51,6 +74,31 @@ function CampaignMatchInner() {
   const [form, setForm] = useState<FormState>(initial);
   const [submitting, setSubmitting] = useState(false);
   const [results, setResults] = useState<MatchResult[] | null>(null);
+  const [v2, setV2] = useState<V2Result | null>(null);
+  const [mode, setMode] = useState<Mode>("classifier_reranker");
+  const [stage, setStage] = useState<string>("");
+
+  useEffect(() => { if (v2) setResults(toMatches(v2[mode].platform)); }, [v2, mode]);
+
+  // v2: classifier v2 + re-ranker on the backend (async job, polled). Returns null on failure so v1 can take over.
+  const runV2 = async (): Promise<V2Result | null> => {
+    try {
+      const res = await fetch(`${API_URL}/api/v2/match`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ instagram_username: form.brand_instagram.replace(/^@/, ""), brand_id: brandId, k: 10 }),
+      });
+      if (!res.ok) return null;
+      const { job_id } = await res.json();
+      for (let t = 0; t < 240; t++) {
+        await sleep(5000);
+        const j = await (await fetch(`${API_URL}/api/v2/jobs/${job_id}`)).json();
+        setStage(j.stage ?? "");
+        if (j.status === "done") return j.result as V2Result;
+        if (j.status === "error") { toast({ title: "Advanced matching failed", description: j.error, variant: "destructive" }); return null; }
+      }
+    } catch (e) { console.error(e); }
+    return null;
+  };
 
   const update = <K extends keyof FormState>(k: K, v: FormState[K]) => setForm((f) => ({ ...f, [k]: v }));
 
@@ -83,6 +131,7 @@ function CampaignMatchInner() {
   const handleSubmit = async () => {
     setSubmitting(true);
     setResults(null);
+    setV2(null);
 
     const maxBudget = Number(form.max_budget);
 
@@ -101,6 +150,15 @@ function CampaignMatchInner() {
       toast({ title: "Could not save campaign", description: insertErr.message, variant: "destructive" });
     }
 
+    const v2res = await runV2();
+    if (v2res) {
+      setV2(v2res);
+      toast({ title: "Campaign launched", description: "Top creator matches are ready below." });
+      setSubmitting(false);
+      return;
+    }
+
+    // fallback: v1 embedding match in Supabase
     const { data: rows, error: rpcErr } = await supabase.rpc(
       "match_influencers_for_brand",
       { p_brand_id: brandId, p_match_count: 10 },
@@ -289,15 +347,37 @@ function CampaignMatchInner() {
           <div className="tile p-10 mt-8 flex flex-col items-center text-center">
             <Loader2 className="w-8 h-8 animate-spin text-primary mb-3" />
             <p className="text-sm text-muted-foreground">Finding your top creator matches...</p>
+            {stage && <p className="text-xs text-muted-foreground mt-1">{stage}</p>}
           </div>
         )}
 
         {results && (
           <section className="mt-10">
-            <div className="flex items-center gap-2 mb-4">
-              <Trophy className="w-5 h-5 text-primary" />
-              <h2 className="text-xl font-bold">Top 10 matches</h2>
+            <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+              <div className="flex items-center gap-2">
+                <Trophy className="w-5 h-5 text-primary" />
+                <h2 className="text-xl font-bold">Top 10 matches</h2>
+              </div>
+              {v2 && (
+                <div className="inline-flex rounded-2xl border border-border p-1 bg-muted/30" role="tablist" aria-label="Matching method">
+                  {([["classifier", "Classifier"], ["classifier_reranker", "Classifier + Re-ranker"]] as [Mode, string][]).map(([m, label]) => (
+                    <button key={m} type="button" role="tab" aria-selected={mode === m} onClick={() => setMode(m)}
+                      className={`px-3 py-1.5 rounded-xl text-xs font-semibold transition-colors ${mode === m ? "bg-primary text-primary-foreground" : "text-muted-foreground"}`}>
+                      {label}
+                    </button>
+                  ))}
+                </div>
+              )}
             </div>
+            {v2 && (
+              <p className="text-xs text-muted-foreground mb-4">
+                Brand classified as <span className="font-semibold text-foreground">{v2.classifier.brand_category}</span>{" "}
+                ({Math.round(v2.classifier.brand_category_confidence * 100)}%) from {v2.brand.posts_analysed} posts.{" "}
+                {mode === "classifier"
+                  ? "Classifier mode: creators in the same category, ordered by embedding similarity."
+                  : `Re-ranker mode (${v2.classifier_reranker.model === "warm" ? `using ${v2.classifier_reranker.seeds_used.length} past collaborators` : "profile only"}): ranks every creator on content fit, partnership history and audience; category is a soft signal, not a filter. Score = percentile among 33.5k creators.`}
+              </p>
+            )}
             <div className="grid gap-4 md:grid-cols-2">
               {results.map((r, i) => {
                 const overBudget = r.rate_per_post != null && r.rate_per_post > Number(form.max_budget);
@@ -307,8 +387,9 @@ function CampaignMatchInner() {
                     initial={{ opacity: 0, y: 20 }}
                     animate={{ opacity: 1, y: 0 }}
                     transition={{ delay: i * 0.06 }}
-                    className="tile p-5 flex items-center gap-4"
+                    className="tile p-5 flex flex-col gap-3"
                   >
+                    <div className="flex items-center gap-4">
                     <div className="relative shrink-0">
                       {r.avatar_url ? (
                         <img src={r.avatar_url} alt={r.name} className="w-14 h-14 rounded-full object-cover" />
@@ -333,7 +414,7 @@ function CampaignMatchInner() {
                     </div>
                     <div className="flex flex-col items-end gap-1.5 shrink-0">
                       <span className={`px-2.5 py-1 rounded-full text-[11px] font-bold border ${scoreColor(r.match_score)}`}>
-                        {r.match_score.toFixed(2)}% match
+                        {v2 ? `Top ${Math.max(0.1, 100 - r.match_score).toFixed(1)}%` : `${r.match_score.toFixed(2)}% match`}
                       </span>
                       {r.rate_per_post != null && (
                         <span
@@ -347,6 +428,14 @@ function CampaignMatchInner() {
                         </span>
                       )}
                     </div>
+                    </div>
+                    {r.reasons && r.reasons.length > 0 && (
+                      <ul className="text-xs text-muted-foreground space-y-1 border-t border-border/40 pt-2">
+                        {r.reasons.map((x, k) => (
+                          <li key={k} className="flex gap-2"><span className="text-primary">•</span><span>{x.text}</span></li>
+                        ))}
+                      </ul>
+                    )}
                   </motion.article>
                 );
               })}
