@@ -43,7 +43,15 @@ type V2Result = {
 };
 
 const API_URL = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+// Resolves after `ms`, or as soon as the tab becomes visible again (mobile browsers pause background timers).
+const waitOrVisible = (ms: number) =>
+  new Promise<void>((resolve) => {
+    let t: ReturnType<typeof setTimeout>;
+    const done = () => { clearTimeout(t); document.removeEventListener("visibilitychange", onVis); resolve(); };
+    const onVis = () => { if (!document.hidden) done(); };
+    t = setTimeout(done, ms);
+    document.addEventListener("visibilitychange", onVis);
+  });
 
 const toMatches = (rows: any[]): MatchResult[] =>
   (rows ?? []).map((r: any) => ({
@@ -89,12 +97,24 @@ function CampaignMatchInner() {
       });
       if (!res.ok) return null;
       const { job_id } = await res.json();
-      for (let t = 0; t < 240; t++) {
-        await sleep(5000);
-        const j = await (await fetch(`${API_URL}/api/v2/jobs/${job_id}`)).json();
-        setStage(j.stage ?? "");
-        if (j.status === "done") return j.result as V2Result;
-        if (j.status === "error") { toast({ title: "Advanced matching failed", description: j.error, variant: "destructive" }); return null; }
+      // Robust polling: a failed request (e.g. phone tab in the background) is retried instead of ending the loop,
+      // and returning to the tab polls immediately.
+      const deadline = Date.now() + 25 * 60 * 1000;
+      while (Date.now() < deadline) {
+        await waitOrVisible(5000);
+        try {
+          const r = await fetch(`${API_URL}/api/v2/jobs/${job_id}`, { cache: "no-store" });
+          if (r.status === 404) { toast({ title: "Matching was interrupted", description: "The server restarted. Please launch again.", variant: "destructive" }); return null; }
+          const j = await r.json();
+          setStage(j.stage ?? "");
+          if (j.status === "done") return j.result as V2Result;
+          if (j.status === "error" || j.status === "cancelled") {
+            toast({ title: "Advanced matching failed", description: j.error ?? j.status, variant: "destructive" });
+            return null;
+          }
+        } catch {
+          setStage("Connection interrupted, retrying...");
+        }
       }
     } catch (e) { console.error(e); }
     return null;
